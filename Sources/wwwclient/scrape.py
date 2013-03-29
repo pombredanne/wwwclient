@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# Encoding: iso-8859-1
 # -----------------------------------------------------------------------------
 # Project   : WWWClient
 # -----------------------------------------------------------------------------
@@ -9,7 +8,7 @@
 # Credits   : Xprima.com
 # -----------------------------------------------------------------------------
 # Creation  : 19-Jun-2006
-# Last mod  : 12-Nov-2008
+# Last mod  : 19-Mar-2012
 # -----------------------------------------------------------------------------
 
 # TODO: The tree could be created by the iterate function, by directly linking
@@ -26,20 +25,46 @@ functions are text oriented, so that they work with any subset of an HTML
 document. This is very useful, as it does not require the HTML to be
 well-formed, and allows easy selection of HTML fragments."""
 
+DEFAULT_ENCODING = "utf-8"
 RE_SPACES    = re.compile("\s+")
 RE_HTMLSTART = re.compile("</?(\w+)",      re.I)
 RE_HTMLEND   = re.compile("/?>")
-RE_HTMLLINK  = re.compile("<[^<]+(href|src)\s*=\s*('[^']*'|\"[^\"]*\"|[^ >]*)", re.I)
+RE_HTMLLINK  = re.compile("<[^<]+(href|src|url)\s*=\s*('[^']*'|\"[^\"]*\"|[^ >]*)", re.I)
 
 RE_HTMLCLASS = re.compile("class\s*=\s*['\"]?([\w\-_\d]+)", re.I)
 RE_HTMLID    = re.compile("id\s*=\s*['\"]?([\w\-_\d]+)", re.I)
 RE_HTMLHREF  = re.compile("href\s*=\s*('[^']*'|\"[^\"]*\"|[^ ]*)", re.I)
 
 RE_SPACES    = re.compile("\s+", re.MULTILINE)
+RE_QUERY     = re.compile("^(?P<name>[\w\d_\-]+)?(?P<id>#[\w\d_\-]+)?(?P<class>\.[\w\d_\-]+)?(?P<property>\:[\w\d\-]+)?(?P<count>\[\-?\d+\])?$")
 
 KEEP_ABOVE    = "+"
 KEEP_SAME     = "="
 KEEP_BELOW    = "-"
+
+# -----------------------------------------------------------------------------
+#
+# URL
+#
+# -----------------------------------------------------------------------------
+
+class URL:
+
+	@classmethod
+	def Base( self, url ):
+		base_url = url
+		if not url.endswith("/"):
+			i = base_url.rfind("/")
+			if i > 0:
+				base_url = base_url[:i + 1]
+		return base_url
+
+	@classmethod
+	def Absolute( self, url, siteURL ):
+		base_url = self.Base(siteURL)
+		if url.find("http") != 0:
+			url = base_url + url
+		return url
 
 # -----------------------------------------------------------------------------
 #
@@ -59,18 +84,23 @@ class Tag:
 		self._html  = html
 		self.start  = start
 		self.end    = end
+	
+	def isElement( self ):
+		return isinstance(self, ElementTag)
+
+	def isText( self ):
+		return isinstance(self, TextTag)
 
 	def html( self ):
 		"""Returns the HTML representation of this tag."""
 		return self._html[self.start:self.end]
 
-
 	def __repr__( self ):
 		return repr(self._html[self.start:self.end])
 
 class ElementTag(Tag):
-	"""An element tag is a tag implementation that represents an HTML element,
-	which can have attributes and contain child elements."""
+	"""Represents a single element tag (open or close) identified within
+	a string."""
 
 	def __init__( self, html, start, end, astart=None, aend=None, attributes=None,
 	level=None, type=None ):
@@ -88,10 +118,12 @@ class ElementTag(Tag):
 			self._attributes = HTML.parseAttributes(self._html[self.astart:self.aend].strip())
 		return self._attributes
 
-	def has( self, name ):
+	def has( self, name, value=None ):
 		"""Tells if this tag has the given attribute"""
-		return self.attributes().has_key(name)
-
+		if value is None:
+			return self.attributes().has_key(name)
+		else:
+			return self.attributes().get(name) == value
 
 	def get( self, name ):
 		"""Returns the given attribute set for this tag."""
@@ -116,6 +148,9 @@ class ElementTag(Tag):
 		else:
 			return what.match(self.name(), re.I)
 
+	def hasName( self, name ):
+		return self.name().lower() == name.lower()
+
 	def hasClass( self, name ):
 		"""Tells if the element has the given class (case sensitive)"""
 		element_class = self.attributes().get("class")
@@ -126,15 +161,19 @@ class ElementTag(Tag):
 
 	def hasId( self, name ):
 		"""Tells if the element has the given id (case sensitive)"""
-		return self.attributes.get("id") == name
+		return self.attributes().get("id") == name
 
-	def text(self):
-		return ''
+	def text(self, encoding=DEFAULT_ENCODING):
+		return u''
 
 class TextTag(Tag):
+	"""Represents raw text, not an element."""
 
 	def __init__( self, html, start, end):
 		Tag.__init__(self, html, start, end)
+
+	def hasName( self, name ):
+		return False
 
 	def hasClass( self, name ):
 		"""Tells if the element has the given class (case sensitive)"""
@@ -144,10 +183,16 @@ class TextTag(Tag):
 		"""Tells if the element has the given id (case sensitive)"""
 		return False
 
-	def text(self):
-		return self._html[self.start:self.end]
+	def text(self, encoding=DEFAULT_ENCODING):
+		return self._html[self.start:self.end].decode(encoding)
+
+	def name(self):
+		return "#text"
 
 class TagList:
+	"""Represents a list of ElementTag and TextTag, which basically corresponds
+	to the tokenization of an HTML string. The list can be folded as a tree
+	if necessary."""
 
 	def __init__( self, content=None ):
 		"""Creates a blank TagTree. It should be populated with data using the
@@ -189,7 +234,7 @@ class TagList:
 				offset = tag_end_offset
 		return self.content
 
-	def tagtree( self ):
+	def tagtree( self, asXML=False ):
 		"""Folds this list into a tree, which is returned as result."""
 		root       = TagTree(id=-1)
 		parents    = [root]
@@ -207,7 +252,25 @@ class TagList:
 			if isinstance(tag, TextTag):
 				parents[-1].append(TagTree(tag))
 			else:
-				if tag.type == Tag.CLOSE:
+				if tag.type in (Tag.OPEN, Tag.EMPTY):
+					if tags_stack and HTML_closeWhen( tag, tags_stack[-1] ) and not asXML:
+						# This is the special treatment when we have to close
+						# tags in HTML
+						# FIXME: The two variables are not used
+						parent_tag = tags_stack.pop()
+						closing_tag = ElementTag(tag._html, tag.start, tag.start, type=Tag.CLOSE)
+						parents.pop().close(tag)
+					if tag.type == Tag.EMPTY or (not asXML and HTML_isEmpty(tag)):
+						node = TagTree(tag, id=counter)
+						parents[-1].append(node)
+						counter   += 1
+					else:
+						node = TagTree(tag, id=counter)
+						parents[-1].append(node)
+						parents.append(node)
+						tags_stack.append(tag)
+						counter   += 1
+				elif tag.type == Tag.CLOSE:
 					opening_tag, level = find_opening_tag(tag, tags_stack)
 					if not opening_tag:
 						#print "WARNING: no opening tag for ", tag
@@ -219,21 +282,7 @@ class TagList:
 						assert stack_tag == opening_tag
 						node.close(tag)
 				else:
-					if tags_stack and HTML_closeWhen( tag, tags_stack[-1] ):
-						# FIXME: The two variables are not used
-						parent_tag = tags_stack.pop()
-						closing_tag = ElementTag(tag._html, tag.start, tag.start, type=Tag.CLOSE)
-						parents.pop().close(tag)
-					if tag.type == Tag.EMPTY or HTML_isEmpty(tag):
-						node = TagTree(tag, id=counter)
-						parents[-1].append(node)
-						counter   += 1
-					else:
-						node = TagTree(tag, id=counter)
-						parents[-1].append(node)
-						parents.append(node)
-						tags_stack.append(tag)
-						counter   += 1
+					raise Exception("Unknow Tag.type: %s" % (tag.type))
 		root._taglist = self
 		return root
 
@@ -252,11 +301,12 @@ class TagList:
 			res.append(tag.html())
 		return "".join(res)
 
-	def text(self):
+	def text(self, encoding=DEFAULT_ENCODING):
 		res = []
 		for tag in self.content:
-			res.append(tag.text())
-		return "".join(res)
+			res.append(tag.text(encoding))
+		# FIXME: Unicode
+		return u"".join(res)
 
 	def __iter__( self ):
 		for tag in self.content:
@@ -265,8 +315,9 @@ class TagList:
 	def __str__( self ):
 		return str(self.content)
 
+# FIXME: Should inherit from TagNode
 class TagTree:
-	"""A tree node wraps one or two tags and allows to structure tags as a tree.
+	"""A tag tree wraps one or two tags and allows to structure tags as a tree.
 	The tree node instance offers a nice interface to manipulate the HTML
 	document as a tree."""
 
@@ -306,11 +357,11 @@ class TagTree:
 		clone.close(self.endTag)
 		return clone
 
-	def has( self, name):
+	def has( self, name, value=None):
 		"""Tells if the start tag of this tag tree has an attribute of the given
 		name."""
 		if self.startTag == None: return None
-		return self.startTag.has(name)
+		return self.startTag.has(name, value)
 
 	def get( self, name):
 		"""Gets the start tag of this tag tree attribute with the given
@@ -384,18 +435,26 @@ class TagTree:
 					root.append(child.clone())
 		return root
 
-	def find( self, predicate, recursive=True ):
-		"""Returns a list of child nodes that match the given predicate. This
-		operation is recursive by default."""
+	def match( self, predicate ):
+		"""Tells if the current TagTree matches the given predicate"""
 		if self.startTag and predicate(self.startTag):
-			return [self]
+			return True
 		else:
-			res = []
-			for c in self.children:
-				if recursive:
-					res.extend(c.find(predicate))
-				elif predicate(c):
-					res.append(c)
+			return False
+
+	def find( self, predicate, recursive=True ):
+		"""Returns a list of child nodes (TagTree objects) that match the given predicate. This
+		operation is recursive by default."""
+		# NOTE: This has been removed, as find means "find inside"
+		# if self.startTag and predicate(self.startTag):
+		# 	return [self]
+		res  = []
+		for c in self.children:
+			assert isinstance(c, TagTree)
+			if predicate(c):
+				res.append(c)
+			if recursive:
+				res = res + c.find(predicate)
 		return res
 
 	def open( self, startTag):
@@ -426,6 +485,12 @@ class TagTree:
 		self._taglist = None
 		return self
 
+	def merge( self, node ):
+		assert isinstance(node, TagTree)
+		for child in node.children:
+			self.append(child)
+		return self
+
 	def list( self, contentOnly=False ):
 		"""Returns a tag list from this Tree Node."""
 		if self._taglist == None:
@@ -438,6 +503,11 @@ class TagTree:
 			return self._taglist.content
 		else:
 			return self._taglist
+
+	def hasName( self, name ):
+		"""Tells if the element has the given class (case sensitive)"""
+		if self.startTag: return self.startTag.hasName(name)
+		else: return None
 
 	def hasClass( self, name ):
 		"""Tells if the element has the given class (case sensitive)"""
@@ -474,6 +544,47 @@ class TagTree:
 						ctext += "    " + line + "\n"
 				res += ctext
 			return res
+
+	def query( self, query ):
+		"""Does a basic CSS-like query on the TagTree. Returns a TagTree"""
+		if type(query) not in (tuple, list):
+			selectors = filter(lambda _:_.strip(), query.split(" "))
+		else:
+			selectors = filter(lambda _:_.strip(), query)
+		if selectors:
+			head      = selectors[0]
+			tail      = []
+			if len(selectors) >= 1: tail = selectors[1:]
+			predicate = lambda: True
+			match     = RE_QUERY.match(head)
+			assert match, "Invalid selector expression: " + repr(head)
+			p_name, p_id, p_class, p_property, p_count = match.group("name"), match.group("id"), match.group("class"), match.group("property"), match.group("count")
+			if p_name:
+				predicate = lambda _:predicate and _.hasName(p_name)
+			if p_id:
+				predicate = lambda _:predicate and _.hasId(p_id[1:])
+			if p_class:
+				predicate = lambda _:predicate and _.hasClass(p_class[1:])
+			res = []
+			for sub_tree in self.find(predicate):
+				res = res + sub_tree.query(tail)
+			if p_property:
+				if p_property == ":text":
+					res = map(lambda _:_.text(), res)
+				else:
+					raise Exception("Property selector not supproted yet: " + p_property)
+			if p_count:
+				count = int(p_count[1:-1])
+				if count < 0:
+					count = len(res) + count
+				if count < len(res):
+					return [res[count]]
+				else:
+					return [None]
+			else:
+				return res
+		else:
+			return [self]
 
 	def __str__( self ):
 		return self.prettyString()
@@ -554,6 +665,10 @@ class HTMLTools:
 		"""Predicate that filters node by class"""
 		return lambda n:n.hasClass(name)
 
+	def withName( self, name ):
+		"""Predicate that filters node by class"""
+		return lambda n:n.hasName(name)
+
 	# BASIC PARSING OPERATIONS
 	# ========================================================================
 
@@ -562,10 +677,10 @@ class HTMLTools:
 		node."""
 		return self.tree(html)
 	
-	def tree( self, html ):
+	def tree( self, html, asXML=False ):
 		tag_list = TagList()
 		tag_list.fromHTML(html, scraper=self)
-		return tag_list.tagtree()
+		return tag_list.tagtree(asXML)
 
 	def list( self, data ):
 		"""Converts the given text or tagtree into a taglist."""
@@ -581,7 +696,8 @@ class HTMLTools:
 			raise Exception("Unsupported data:" + data)
 
 	def html( self, data ):
-		"""Converts the given taglist or tagtree into HTML.""" 
+		"""Converts the given taglist or tagtree into HTML, and returns
+		a string or unicode.""" 
 		if type(data) == str:
 			return data
 		elif type(data) == unicode:
@@ -629,6 +745,8 @@ class HTMLTools:
 
 	def expand( self, text, encoding=None ):
 		"""Expands the entities found in the given text."""
+		if not (type(text) in (str, unicode)):
+			text = text.text()
 		# NOTE: This is based on
 		# <http://www.shearersoftware.com/software/developers/htmlfilter/>
 		entityStart = text.find('&')
@@ -679,24 +797,30 @@ class HTMLTools:
 	def forms( self, html ):
 		return form.parseForms(self, self.html(html))
 
+	def images( self, html, like=None ):
+		"""Iterates through the links found in this document. This yields the
+		tag name and the href value."""
+		for name, url in self.links(html, like):
+			if name == "img":
+				yield url
+
 	def links( self, html, like=None ):
 		"""Iterates through the links found in this document. This yields the
 		tag name and the href value."""
-		if not html: raise Exception("No data: " + repr(html))
-		html = self.html(html)
-		if like != None:
-			if type(like) in (str,unicode): like = re.compile(like)
-		res = []
-		for match in self.onRE(html, RE_HTMLLINK):
-			tag  = match.group()
-			tag  = tag.replace("\t"," ")
-			tag  = tag.replace("\n"," ")
-			tag  = tag[1:tag.find(" ")]
-			href = match.group(2)
-			if href[0] in ("'", '"'): href = href[1:-1]
-			if not like or like.match(href):
-				res.append((tag, href))
-		return res
+		if html:
+			html = self.html(html)
+			if like != None:
+				if type(like) in (str,unicode): like = re.compile(like)
+			res = []
+			for match in self.onRE(html, RE_HTMLLINK):
+				tag  = match.group()
+				tag  = tag.replace("\t"," ")
+				tag  = tag.replace("\n"," ")
+				tag  = tag[1:tag.find(" ")]
+				href = match.group(2)
+				if href[0] in ("'", '"'): href = href[1:-1]
+				if not like or like.match(href):
+					yield tag, href
 
 	# UTILITIES
 	# ========================================================================
@@ -770,6 +894,8 @@ class HTMLTools:
 				if name: attribs[name] = None
 				return HTML.parseAttributes(text[space+1:], attribs)
 		else:
+			if eq + 1 == len(text):
+				return attribs
 			sep = text[eq+1]
 			if   sep == "'": end = text.find( "'", eq + 2 )
 			elif sep == '"': end = text.find( '"', eq + 2 )

@@ -9,15 +9,15 @@
 # Credits   : Xprima.com
 # -----------------------------------------------------------------------------
 # Creation  : 19-Jun-2006
-# Last mod  : 30-Jul-2006
+# Last mod  : 04-Mar-2013
 # -----------------------------------------------------------------------------
 
 # TODO: Allow Request to have parameters in body or url and attachments as well
 # TODO: Add   sessoin.status, session.headers, session.links(), session.scrape()
 # TODO: Add   session.select() to select a form before submit
 
-import urlparse, urllib, mimetypes, re, os, time
-import client, defaultclient, scrape
+import urlparse, urllib, mimetypes, re, os, sys, time, json, random, hashlib, httplib, base64, socket
+from   wwwclient import client, defaultclient, scrape, agents
 
 HTTP               = "http"
 HTTPS              = "https"
@@ -30,6 +30,44 @@ METHODS            = (GET, POST, HEAD)
 
 FILE_ATTACHMENT    = client.FILE_ATTACHMENT
 CONTENT_ATTACHMENT = client.CONTENT_ATTACHMENT
+
+def quote(path):
+	return urllib.quote(path, '/%')
+
+def fix(s, charset='utf-8'):
+	"""Sometimes you get an URL by a user that just isn't a real
+	URL because it contains unsafe characters like ' ' and so on.  This
+	function can fix some of the problems in a similar way browsers
+	handle data entered by the user:
+
+	>>> url_fix(u'http://de.wikipedia.org/wiki/Elf (Begriffsklärung)')
+	'http://de.wikipedia.org/wiki/Elf%20%28Begriffskl%C3%A4rung%29'
+
+	:param charset: The target charset for the URL if the url was
+					given as unicode string.
+	"""
+	if isinstance(s, unicode): s = s.encode(charset, 'ignore')
+	scheme, netloc, path, qs, anchor = urlparse.urlsplit(s)
+	path = urllib.quote(path, '/%')
+	qs = urllib.quote_plus(qs, ':&=')
+	return urlparse.urlunsplit((scheme, netloc, path, qs, anchor))
+
+def retry( function, times=5, wait=(0.1, 0.5, 1, 1.5, 2), exception=None):
+	"""Retries the given function at most `times`, waiting wait seconds. If
+	wait is an array, the `wait[0]` will be waited on the first try, 
+	`wait[1]` on the second, and so on."""
+	if times <= 0:
+		raise exception
+	if type(wait) in (tuple, list):
+		delay = wait[0]
+		wait  = wait[1:] if len(wait) > 1 else wait
+	else:
+		delay = wait
+	try:
+		return function()
+	except Exception, e:
+		time.sleep(delay)
+		return retry(function, times - 1, wait, e)
 
 # -----------------------------------------------------------------------------
 #
@@ -69,6 +107,14 @@ class Pairs:
 				return value
 		return None
 
+	def has( self, name ):
+		"""Tells if the pair has a field with the given name
+		(case-insensitive)"""
+		for key, value in self.pairs:
+			if name.lower().strip() == key.lower().strip():
+				return True
+		return False
+
 	def add( self, name, value=None ):
 		"""Adds the given value to the given name. This does not destroy what
 		already existed. (if the pair already exists, it is not added twice."""
@@ -89,8 +135,18 @@ class Pairs:
 			for name, value in parameters.items():
 				self.add(name, value)
 		elif type(parameters) in (tuple, list):
-			for name, value in parameters:
-				self.add(name, value)
+			for v in parameters:
+				if type(v) in (tuple, list):
+					name, value = v
+					self.add(name, value)
+				elif type(v) in (str, unicode):
+					if v:
+						name, value = v.split(":", 1)
+						self.add(name.strip(), value.strip())
+				else:
+					raise Exception("Pair.merge: Unsupported type for merging %s" % (parameters))
+		elif type(parameters) in (str, unicode):
+			return self.merge(parameters.split("\n"))
 		elif isinstance(parameters, Pairs):
 			for name, value in parameters.pairs:
 				self.add(name, value)
@@ -178,9 +234,6 @@ class Request:
 		# Ensures that the method is a proper one
 		if self._method not in METHODS:
 			raise Exception("Method not supported: %s" % (method))
-		if headers:
-			for h,v in headers.items():
-				self.header(h,v)
 		if mimetype:
 			self.header("Content-Type", mimetype)
 
@@ -274,6 +327,10 @@ class Transaction:
 	
 	"""
 
+	STATUS  = 0
+	HEADERS = 1
+	BODY    = 2
+
 	def __init__( self, session, request ):
 		self._client     = session._httpClient
 		self._session    = session
@@ -282,6 +339,7 @@ class Transaction:
 		self._cookies    = Pairs()
 		self._newCookies = None
 		self._done       = False
+		self._responses  = []
 
 	def session( self ):
 		"""Returns this transaction session"""
@@ -302,8 +360,9 @@ class Transaction:
 	
 	def headers( self ):
 		"""Returns the headers received by the response."""
-		# TODO: IMPLEMENT ME
-		assert None, "Not implemented"
+		headers = self._responses[-1][self.HEADERS]
+		headers = self._client._parseHeaders(headers)
+		return Pairs(headers)
 
 	def newCookies( self ):
 		"""Returns the list of new cookies."""
@@ -325,10 +384,21 @@ class Transaction:
 		assert self._done
 		return scrape.HTML.links(self.data())
 
+	def body( self ):
+		"""Returns the response data (implies that the transaction was
+		previously done)"""
+		if self._responses:
+			return self._responses[-1][self.BODY]
+		else:
+			return None
+
 	def data( self ):
 		"""Returns the response data (implies that the transaction was
 		previously done)"""
-		return self._client.data()
+		return self.body()
+	
+	def dataAsJSON( self ):
+		return json.loads(self.data())
 
 	def redirect( self ):
 		"""Returns the URL to which the response redirected, if any."""
@@ -345,21 +415,28 @@ class Transaction:
 		if self._done: return
 		# We prepare the headers
 		request  = self.request()
-		headers  = request.headers() 
-		self._session._log(request.method(), request.url())
+		headers  = request.headers()
+		response = None
+		# if self._verbose >= 1:
+		# 	self._session._log(request.method(), request.url())
 		# We merge the session cookies into the request
 		request.cookies().merge(self.session().cookies())
 		# As well as this transaction cookies
 		request.cookies().merge(self.cookies())
 		# We send the request as a GET
 		if request.method() == GET:
-			self._client.GET(
+			responses = self._client.GET(
+				request.url(),
+				headers=request.headers().asHeaders()
+			)
+		elif request.method() == HEAD:
+			responses = self._client.HEAD(
 				request.url(),
 				headers=request.headers().asHeaders()
 			)
 		# Or as a POST
 		elif request.method() == POST:
-			self._client.POST(
+			responses = self._client.POST(
 				request.url(),
 				data=request.data(),
 				attach=request.attachments(),
@@ -370,14 +447,32 @@ class Transaction:
 		else:
 			raise Exception("Unsupported method:", request.method())
 		# We merge the new cookies if necessary
-		self._status = self._client.status()
+		self._status     = self._client.status()
 		self._newCookies = Pairs(self._client.newCookies())
-		self._done = True
+		self._done       = True
+		self._responses += responses
 		return self
 
 	def done( self ):
 		"""Tells if the transaction is done/complete."""
 		return self._done
+
+	# SCRAPING ________________________________________________________________
+	def asTree( self ):
+		return scrape.HTML.tree(self.data())
+
+	def unjson( self ):
+		return json.loads(self.data())
+
+	def query( self, selector ):
+		"""Converts the current transaction to an HTML/XML tree and applies
+		the given CSS selector query."""
+		return self.asTree().query(selector)
+
+	def save( self, path ):
+		"""Saves the current transaction data to the current file"""
+		with file(path,"wb") as f:
+			f.write(self.data())
 
 	def __str__( self ):
 		return self.data()
@@ -402,20 +497,26 @@ class Session:
 	- 'transactions':    List of transactions
 	- 'maxTransactions': Maximum number of transactions in registered in
 	                     this session
+	- 'cache':           Cache contained last requests
 	- 'cookies':         List of cookies for this session
 	- 'userAgent':       String for this user session agent
 
 	"""
 
 	MAX_TRANSACTIONS = 10
-	DEFAULT_RETRIES  = 5
+	REDIRECT_LIMIT   = 5
+	DEFAULT_RETRIES  = [0.25, 0.5, 1.0, 1.5, 2.0]
 	DEFAULT_DELAY    = 1
 
-	def __init__( self, url=None, verbose=True, personality=None, follow=True, do=True ):
+	def __init__( self, url=None, verbose=0, personality="random", follow=True, do=True, delay=None, cache=None ):
 		"""Creates a new session at the given host, and for the given
-		protocol."""
+		protocol.
+		Keyword arguments::
+			'delay':  the range of delay between two requests e.g: (1.5, 3)"""
 		self._httpClient      = defaultclient.HTTPClient()
+		if cache: self._httpClient.setCache(cache)
 		self._host            = None
+		self._port            = 80
 		self._protocol        = None
 		self._transactions    = []
 		self._cookies         = Pairs()
@@ -426,6 +527,9 @@ class Session:
 		self._onLog           = None
 		self._follow          = follow
 		self._do              = do
+		self._delay           = delay
+		self._headers         = []
+		if type(personality) in (unicode,str): personality = Personality.Get(personality)
 		self._personality     = personality
 		self.MERGE_COOKIES    = True
 		self.verbose(verbose)
@@ -446,7 +550,14 @@ class Session:
 		if self._onLog:
 			self._onLog(*args)
 		else:
-			print " ".join(map(str,args))
+			sys.stderr.write(" ".join(map(str,args)) + "\n")
+
+	def auth( self, user, passwd ):
+		"""Adds an HTTP Authentication header to the curent session based on the given
+		user and password."""
+		self._headers = filter(lambda _:_[0]!="Authorization", self._headers)
+		self._headers.append(("Authorization", "Basic " + base64.b64encode(user + ":" + passwd)))
+		return self
 
 	def setLogger( self, callback ):
 		"""Sets the logger callback (only enabled when the session is set to
@@ -556,7 +667,10 @@ class Session:
 		else:
 			self._referer = value
 
-	def get( self, url="/", params=None, headers=None, follow=None, do=None, cookies=None ):
+	def head( self, url="/", params=None, headers=None, follow=None, do=None, cookies=None, retry=[] ):
+		return self.get(url=url, params=params, headers=headers, follow=follow, do=do, cookies=cookies, retry=retry, method=HEAD)
+
+	def get( self, url="/", params=None, headers=None, follow=None, do=None, cookies=None, retry=[], method=GET):
 		"""Gets the page at the given URL, with the optional params (as a `Pair`
 		instance), with the given headers.
 
@@ -569,20 +683,40 @@ class Session:
 		if do is None: do = self._do
 		# TODO: Return data instead of session
 		url = self.__processURL(url)
-		request     = self._createRequest( url=url, params=params, headers=headers, cookies=cookies )
+		request     = self._createRequest( url=url, params=params, headers=headers, cookies=cookies, method=method )
 		transaction = Transaction( self, request )
 		self.__addTransaction(transaction)
-		# We do the transaction
+		# FIXME: Redo on timeout
 		if do:
-			transaction.do()
+			# We do the transaction
+			# set a delay to do the transaction if _delay is specified
+			if self._delay: time.sleep(random.uniform(*self._delay))
+			# ensure that transaction.do retries after a fail
+			retry = retry or self.DEFAULT_RETRIES
+			for i,r in enumerate(retry):
+				try:
+					transaction.do()
+					break
+				except httplib.IncompleteRead, e:
+					if i >= len(retry):
+						raise e
+					else:
+						time.sleep(r)
 			if self.MERGE_COOKIES: self._cookies.merge(transaction.newCookies())
-			# And follow the redirect if any
-			while transaction.redirect() and follow:
-				transaction = self.get(transaction.redirect(), do=True)
+			visited   = [url]
+			iteration = 0
+			while transaction.redirect() and follow and iteration < self.REDIRECT_LIMIT:
+				redirect_url = self.__processURL(transaction.redirect(), store=False)
+				if not (redirect_url in visited):
+					visited.append(redirect_url)
+					transaction = self.get(redirect_url, headers=headers, cookies=cookies, do=True, method=method, follow=False)
+				else:
+					break
 		return transaction
 
+	
 	def post( self, url=None, params=None, data=None, mimetype=None,
-	fields=None, attach=None, headers=None, follow=None, do=None, cookies=None ):
+	fields=None, attach=None, headers=None, follow=None, do=None, cookies=None, retry=[]):
 		"""Posts data to the given URL. The optional `params` (`Pairs`) or `data`
 		contain the posted data. The `mimetype` describes the mimetype of the data
 		(if it is a special kind of data). The `fields` is a `Pairs` instance of
@@ -605,11 +739,30 @@ class Session:
 		transaction = Transaction( self, request )
 		self.__addTransaction(transaction)
 		if do:
-			transaction.do()
+			# We do the transaction
+			# set a delay to do the transaction if _delay is specified
+			if self._delay: time.sleep(random.uniform(*self._delay))
+			# ensure that transaction.do retries after a fail
+			retry = retry or self.DEFAULT_RETRIES
+			for i,r in enumerate(retry):
+				try:
+					transaction.do()
+					break
+				except httplib.IncompleteRead, e:
+					if i >= len(retry):
+						raise e
+					else:
+						time.sleep(r)
 			if self.MERGE_COOKIES: self._cookies.merge(transaction.newCookies())
 			# And follow the redirect if any
+			visited = [url]
 			while transaction.redirect() and follow:
-				transaction = self.get(transaction.redirect(), do=True)
+				redirect_url = self.__processURL(transaction.redirect(), store=False)
+				if not (redirect_url in visited):
+					visited.append(redirect_url)
+					transaction = self.post(redirect_url, data=data, mimetype=mimetype, fields=fields, attach=attach, headers=headers, cookies=cookies, do=True)
+				else:
+					break
 		return transaction
 
 	def submit( self, form, values={}, attach=[], action=None,  method=POST,
@@ -633,7 +786,7 @@ class Session:
 		# FIXME: Manage encodings consistently
 		if method == POST or attach:
 			return self.post( url, fields=fields, attach=attach, do=do, cookies=cookies )
-		elif method == GET:
+		elif method in (GET, HEAD):
 			assert not attach, "Attachments are incompatible with GET submission"
 			return self.get( url,  params=fields, do=do, cookies=cookies )
 		else:
@@ -656,35 +809,55 @@ class Session:
 			retry -= 1
 		return res
 
-	def savePage(self, path, transaction=None):
+	def save(self, path, transaction=None):
 		"""Saves the page from the given transaction (default it 'last()') to
 		the given file."""
 		if transaction is None: transaction = self.last()
 		d = transaction.data()
-		print type(d)
 		f = file(path,'w')
 		f.write(d)
 		f.close()
 
-	def __processURL( self, url ):
+	def __processURL( self, url, store=True ):
 		"""Processes the given URL, by storing the host and protocol, and
 		returning a normalized, absolute URL"""
 		old_url = url
 		if url == None and not self._transactions: url = "/"
 		if url == None and self._transactions: url = self.last().request.url()
-		# If we have no default host, then we ensure that there is an http
-		# prefix (for instance, www.google.com could be mistakenly interpreted
-		# as a path)
-		if self._host == None:
-			if not url.startswith("http"): url = "http://" + url
-		# And now we parse the url and update the session attributes
-		protocol, host, path, parameters, query, fragment =  urlparse.urlparse(url)
-		if   protocol == "http": self._protocol  = HTTP
-		elif protocol == "https": self._protocol = HTTPS
-		if host: self._host =  host
+		proto_rest = url.split("://",1)
+		if len(proto_rest) == 2 and proto_rest[0].find("/") == -1:
+			# If the URL was given with a protocol, then we might change server
+			protocol, host, path, parameters, query, fragment =  urlparse.urlparse(url)
+		else:
+			# Otherwise we expect to be on the same server (and then just the
+			# path is given)
+			assert self._host, "No host was given to url: {0}".format(url)
+			protocol, host, path, parameters, query, fragment =  urlparse.urlparse(
+				"%s://%s:%s%s" % (
+					(self._protocol or HTTP),
+					self._host,
+					self._port or 80,
+					url[0] == "/" and url or ("/" + url)
+			))
+		if store:
+			if   protocol == "http":  self._protocol = protocol = HTTP
+			elif protocol == "https": self._protocol = protocol = HTTPS
+		port = None
+		if host:
+			host = host.split(":")
+			if len(host) == 1:
+				host = host[0]
+			else:
+				port = host[1]
+				host = host[0]
+			if store:
+				self._host = host
+				self._port = port
 		# We recompose the url
-		assert not path.startswith("ppg.h")
-		url = "%s://%s" % (self._protocol, self._host)
+		if port:
+			url = "%s://%s:%s" % (protocol, host, port)
+		else:
+			url = "%s://%s" % (protocol, host)
 		if   path and path[0] == "/": url += path
 		elif path:      url += "/" + path
 		else:           url += "/"
@@ -694,6 +867,8 @@ class Session:
 		return url
 
 	def _createRequest( self, **kwargs ):
+		# We copyt the session headers (ie. authentication)
+		kwargs["headers"] = (kwargs.get("headers") or []) + self._headers
 		request = Request(**kwargs)
 		last    = self.last()
 		if self.referer(): request.header("Referer", self.referer())
@@ -721,33 +896,29 @@ class Personality:
 	Personalities allow to ensure that specific headers are set in all requests,
 	so that the requests really look like they come from a specific browser."""
 
-	def __init__( self ):
-		pass
+	@classmethod
+	def Get( self, agent ):
+		if agent == "random":
+			return self.Get(agents.pickAgent())
+		elif agent.lower() == "firefox":
+			return Firefox()
+		else:
+			return self(agent)
+
+	def __init__( self, agent ):
+		self.agent = agents.pickLatest(agent)
 	
+	def userAgent( self ):
+		return self.agent[-1]
+
 	def apply( self, request ):
 		pass
 
-class FireFox(Personality):
-	"""Simulates the way FireFox would behave."""
+class Firefox(Personality):
+	"""Simulates the way Firefox would behave."""
 
 	def __init__( self ):
-		Personality.__init__(self)
-		self.desktop        = "X11"
-		self.platform       = "Linux i686"
-		self.languages      = "en-US"
-		self.revision       = "1.9"
-		self.geckoVersion   = "2008061015"
-		self.firefoxVersion = "3.0"
-
-	def userAgent( self ):
-		return "Mozilla/5.0 (%s; U; %s; %s; rv:%s) Gecko/%s Firefox/%s" % (
-			self.desktop,
-			self.platform,
-			self.languages,
-			self.revision,
-			self.geckoVersion,
-			self.firefoxVersion,
-		)
+		Personality.__init__(self, "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:11.0) Gecko/20100101 Firefox/11.0")
 
 	def apply( self, request ):
 		request.header( "User-Agent", self.userAgent())

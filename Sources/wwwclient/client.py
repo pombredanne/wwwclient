@@ -34,13 +34,13 @@ among different sessions.
 FILE_ATTACHMENT    = 0
 CONTENT_ATTACHMENT = 1
 
-RE_CONTENT_LENGTH  = re.compile("\s*Content-Length\s*:\s*([0-9]+)", re.I|re.MULTILINE)
-RE_CONTENT_ENCODING= re.compile("\s*Content-Encoding\s*:(.*)\r\n", re.I|re.MULTILINE)
-RE_CONTENT_TYPE    = re.compile("\s*Content-Type\s*:\s*([0-9]+)",   re.I|re.MULTILINE)
+RE_CONTENT_LENGTH  = re.compile("^\s*Content-Length\s*:\s*([0-9]+)", re.I|re.MULTILINE)
+RE_CONTENT_ENCODING= re.compile("^\s*Content-Encoding\s*:(.*)\r\n", re.I|re.MULTILINE)
+RE_CONTENT_TYPE    = re.compile("^\s*Content-Type\s*:(.*)\r\n",   re.I|re.MULTILINE)
 RE_CHARSET         = re.compile("\s*charset=([\w\d_-]+)",           re.I|re.MULTILINE)
-RE_LOCATION        = re.compile("\s*Location\s*:(.*)\r\n",          re.I|re.MULTILINE)
-RE_SET_COOKIE      = re.compile("\s*Set-Cookie\s*:(.*)\r\n",        re.I|re.MULTILINE)
-RE_CHUNKED         = re.compile("\s*Transfer-Encoding\s*:\s*chunked\s*\r\n", re.I|re.MULTILINE)
+RE_LOCATION        = re.compile("^\s*Location\s*:(.*)\r\n",          re.I|re.MULTILINE)
+RE_SET_COOKIE      = re.compile("^\s*Set-Cookie\s*:(.*)\r\n",        re.I|re.MULTILINE)
+RE_CHUNKED         = re.compile("^\s*Transfer-Encoding\s*:\s*chunked\s*\r\n", re.I|re.MULTILINE)
 CRLF               = "\r\n"
 BOUNDARY           = '----------fbb6cc131b52e5a980ac702bedde498032a88158$'
 DEFAULT_MIMETYPE   = 'text/plain'
@@ -58,6 +58,7 @@ class HTTPClient:
 	def __init__( self, encoding="latin-1" ):
 		"""Creates a new HTTPClient with the given 'encoding' as default
 		encofing ('latin-1' is the default)."""
+		self._method     = "GET"
 		self._url        = None
 		self._host       = None
 		self._protocol   = None
@@ -66,6 +67,7 @@ class HTTPClient:
 		self._newCookies = None
 		self._responses  = None
 		self._onLog      = None
+		self._cache      = None
 		self.verbose     = 0
 		self.encoding    = encoding
 		self.retryDelay  = 0.100
@@ -78,8 +80,16 @@ class HTTPClient:
 		else:
 			print " ".join(map(str,args))
 
+	def setCache( self, cache ):
+		"""Set a cache"""
+		self._cache = cache
+	
+	def method( self ):
+		"""Returns the method of the last request by this HTTP client."""
+		return self._method
+
 	def url( self ):
-		"""Returns the last URL processed by this Curl HTTP interface."""
+		"""Returns the last URL processed by this HTTP client."""
 		return self._url
 	
 	def host( self ):
@@ -128,14 +138,15 @@ class HTTPClient:
 			total += len(r)
 		return total
 
-	def info( self ):
-		return "\n".join((
-			"URL          : %s" % (self.url()),
-			"Status       : %s" % (self.status()),
-			"Redirect     : %s" % (self.redirect()),
-			"New-Cookies  : %s" % (self.newCookies()),
-			"Responses    : %s [%sb]" % (len(self.responses()),self.dataSize()),
-		))
+	def info( self, level=1 ):
+		return "%s %s (%s)" % (self.method(), self.url(), self.status())
+		# return "\n".join((
+		# 	"URL           : %s" % (self.url()),
+		# 	"- status      : %s" % (self.status()),
+		# 	"- redirect    : %s" % (self.redirect()),
+		# 	"- cookies(new): %s" % (self.newCookies()),
+		# 	"- responses   : #%s (%sbytes)" % (len(self.responses()),self.dataSize()),
+		# ))
 
 	def encode( self, fields=(), attach=() ):
 		"""Encodes the given fields and attachments (as given to POST) and
@@ -256,11 +267,17 @@ class HTTPClient:
 			if eoh == -1: eoh = len(message)
 			first_line       = message[off:eol]
 			headers          = message[eol+2:eoh]
+			# FIXME: This is not very efficient, we should parse all headers
+			# into a structure, rahter than searching
 			charset          = RE_CHARSET.search(headers)
 			is_chunked       = RE_CHUNKED.search(headers)
 			content_length   = RE_CONTENT_LENGTH.search(headers)
 			content_encoding = RE_CONTENT_ENCODING.search(headers)
-			if content_encoding: content_encoding = content_encoding.group(1)
+			content_type     = RE_CONTENT_TYPE.search(headers)
+			if content_encoding:
+				content_encoding = content_encoding.group(1)
+			if content_type:
+				content_type     = content_type.group(1)
 			if charset:
 				encoding   = charset.group(1)
 			else:
@@ -283,7 +300,8 @@ class HTTPClient:
 					body = self._decodeBody(message[eoh+4:], content_encoding, encoding)
 				off = len(message)
 			location, cookies = self._parseStatefulHeaders(headers)
-			self._redirect   = location
+			# WTF: 
+			self._redirect    = location
 			self._newCookies.extend(self._parseCookies(cookies))
 			# FIXME: I don't know if it works properly, but at least it handles
 			# responses from <http://www.contactor.se/~dast/postit.cgi> properly.
@@ -304,13 +322,15 @@ class HTTPClient:
 		if contentEncoding:
 			if contentEncoding.lower().strip() == "gzip":
 				body = zlib.decompress(body)
-				if encoding: return body.decode(encoding)
-				else: return body
+				#if encoding: return body.decode(encoding)
+				#else: return body
+				return body
 			else:
 				raise Exception("Unsupported content encoding: " + contentEncoding)
 		else:
-			if encoding: return body.decode(encoding)
-			else: return body
+			# FIXME: Should not force encoding, only if it's a string
+			#if encoding: return body.decode(encoding)
+			return body
 
 	def _parseStatefulHeaders( self, headers ):
 		"""Return the Location and Set-Cookie headers from the given header
@@ -320,18 +340,22 @@ class HTTPClient:
 		headers += "\r\n"
 		location    = RE_LOCATION.search(headers)
 		if location: location = location.group(1).strip()
-		set_cookie = RE_SET_COOKIE.search(headers)
-		if set_cookie: set_cookie = set_cookie.group(1).strip()
+		cookies    = RE_SET_COOKIE.findall(headers)
+		set_cookie = ";".join(cookies)
 		return location, set_cookie
 	
 	def _parseCookies( self, cookies ):
 		"""Returns a pair (name, value) for the given cookies, given as text."""
-		res = []
+		_cookies   = {}
+		res        = []
 		if not cookies: return res
 		for cookie in cookies.split(";"):
 			equal = cookie.find("=")
-			key   = cookie[:equal].strip()
-			value = cookie[equal+1:].strip()
+			if equal > 0:
+				key           = cookie[:equal].strip()
+				value         = cookie[equal+1:].strip()
+				_cookies[key] = value
+		for key, value in _cookies.items():
 			res.append((key, value))
 		return res
 
